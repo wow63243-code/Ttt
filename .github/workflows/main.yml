@@ -1,0 +1,1015 @@
+name: Build Camera From Phone (PS4)
+
+# Add just this one file to your repo at .github/workflows/build.yml.
+# It writes every project file itself, downloads the OpenOrbis PS4 toolchain,
+# compiles, and hands you the .pkg as a downloadable artifact.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install compiler
+        run: sudo apt-get update && sudo apt-get install -y clang lld zip unzip
+
+      - name: Download OpenOrbis toolchain release
+        run: |
+          mkdir -p "$RUNNER_TEMP/tc-dl" && cd "$RUNNER_TEMP/tc-dl"
+          gh release view -R OpenOrbis/OpenOrbis-PS4-Toolchain --json tagName,assets -q '.tagName, (.assets[].name)'
+          ASSET=$(gh release view -R OpenOrbis/OpenOrbis-PS4-Toolchain --json assets -q '.assets[].name' | grep -i linux | head -n1 || true)
+          if [ -z "$ASSET" ]; then
+            ASSET=$(gh release view -R OpenOrbis/OpenOrbis-PS4-Toolchain --json assets -q '.assets[].name' | grep -iE '\.(zip|tar\.gz|tgz)$' | head -n1)
+          fi
+          echo "Using release asset: $ASSET"
+          gh release download -R OpenOrbis/OpenOrbis-PS4-Toolchain -p "$ASSET"
+          mkdir -p "$RUNNER_TEMP/toolchain"
+          case "$ASSET" in
+            *.zip) unzip -q "$ASSET" -d "$RUNNER_TEMP/toolchain" ;;
+            *.tar.gz|*.tgz) tar -xzf "$ASSET" -C "$RUNNER_TEMP/toolchain" ;;
+            *) echo "Unknown archive type: $ASSET"; exit 1 ;;
+          esac
+          LINKX=$(find "$RUNNER_TEMP/toolchain" -name link.x | head -n1)
+          if [ -z "$LINKX" ]; then echo "link.x not found - toolchain layout changed"; find "$RUNNER_TEMP/toolchain" -maxdepth 2; exit 1; fi
+          TC=$(dirname "$LINKX")
+          echo "OO_PS4_TOOLCHAIN=$TC" >> "$GITHUB_ENV"
+          chmod +x "$TC"/bin/linux/* || true
+          ls "$TC" "$TC/lib" "$TC/bin/linux"
+
+      - name: Write project files
+        run: |
+          mkdir -p work/camera_from_phone && cd work/camera_from_phone
+          mkdir -p sce_sys/about sce_module assets
+          mkdir -p "$(dirname 'Makefile')"
+          cat > 'Makefile' <<'CFP_EOF_0'
+          # Camera From Phone - PS4 receiver (OpenOrbis PS4 Toolchain, plain C)
+          #
+          #   export OO_PS4_TOOLCHAIN=/path/to/OpenOrbis/PS4Toolchain
+          #   make            -> IV0000-CFPH00001_00-CAMERAFROMPHONE0.pkg
+          #   make check      -> compile-only syntax check (needs no linker, libs or packaging tools)
+          #   make clean
+
+          # Package metadata.
+          TITLE       := Camera From Phone
+          VERSION     := 1.00
+          TITLE_ID    := CFPH00001
+          CONTENT_ID  := IV0000-CFPH00001_00-CAMERAFROMPHONE0
+
+          # Libraries linked into the ELF.
+          LIBS        := -lc -lkernel -lSceVideoOut
+
+          # Additional compile flags.
+          EXTRAFLAGS  := -O2 -Wall
+
+          # Asset and module directories.
+          ASSETS      := $(wildcard assets/**/*)
+          LIBMODULES  := $(wildcard sce_module/*)
+
+          # Root vars
+          TOOLCHAIN   := $(OO_PS4_TOOLCHAIN)
+          PROJDIR     := $(shell basename $(CURDIR))
+          INTDIR      := $(PROJDIR)/x64/Debug
+
+          # Define objects to build
+          CFILES      := $(wildcard $(PROJDIR)/*.c)
+          OBJS        := $(patsubst $(PROJDIR)/%.c, $(INTDIR)/%.o, $(CFILES))
+
+          # Final C flags / linker flags
+          CFLAGS      := --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -c $(EXTRAFLAGS) -isysroot $(TOOLCHAIN) -isystem $(TOOLCHAIN)/include
+          LDFLAGS     := -m elf_x86_64 -pie --script $(TOOLCHAIN)/link.x --eh-frame-hdr -L$(TOOLCHAIN)/lib $(LIBS) $(TOOLCHAIN)/lib/crt1.o
+
+          # Create the intermediate directory in case it doesn't already exist.
+          _unused     := $(shell mkdir -p $(INTDIR))
+
+          # Linux vs macOS: where clang/lld live and which tool binaries to use.
+          UNAME_S     := $(shell uname -s)
+
+          ifeq ($(UNAME_S),Linux)
+          		CC      := clang
+          		LD      := ld.lld
+          		CDIR    := linux
+          endif
+          ifeq ($(UNAME_S),Darwin)
+          		# Homebrew LLVM: /opt/homebrew on Apple Silicon, /usr/local on Intel.
+          		LLVM    := $(shell brew --prefix llvm 2>/dev/null)
+          		CC      := $(LLVM)/bin/clang
+          		LD      := $(LLVM)/bin/ld.lld
+          		CDIR    := macos
+          endif
+
+          all: $(CONTENT_ID).pkg
+
+          $(CONTENT_ID).pkg: pkg.gp4
+          	$(TOOLCHAIN)/bin/$(CDIR)/PkgTool.Core pkg_build $< .
+
+          pkg.gp4: eboot.bin sce_sys/about/right.sprx sce_sys/param.sfo sce_sys/icon0.png $(LIBMODULES) $(ASSETS)
+          	$(TOOLCHAIN)/bin/$(CDIR)/create-gp4 -out $@ --content-id=$(CONTENT_ID) --files "$^"
+
+          sce_sys/param.sfo: Makefile
+          	$(TOOLCHAIN)/bin/$(CDIR)/PkgTool.Core sfo_new $@
+          	$(TOOLCHAIN)/bin/$(CDIR)/PkgTool.Core sfo_setentry $@ APP_TYPE --type Integer --maxsize 4 --value 1
+          	$(TOOLCHAIN)/bin/$(CDIR)/PkgTool.Core sfo_setentry $@ APP_VER --type Utf8 --maxsize 8 --value '$(VERSION)'
+          	$(TOOLCHAIN)/bin/$(CDIR)/PkgTool.Core sfo_setentry $@ ATTRIBUTE --type Integer --maxsize 4 --value 0
+          	$(TOOLCHAIN)/bin/$(CDIR)/PkgTool.Core sfo_setentry $@ CATEGORY --type Utf8 --maxsize 4 --value 'gd'
+          	$(TOOLCHAIN)/bin/$(CDIR)/PkgTool.Core sfo_setentry $@ CONTENT_ID --type Utf8 --maxsize 48 --value '$(CONTENT_ID)'
+          	$(TOOLCHAIN)/bin/$(CDIR)/PkgTool.Core sfo_setentry $@ DOWNLOAD_DATA_SIZE --type Integer --maxsize 4 --value 0
+          	$(TOOLCHAIN)/bin/$(CDIR)/PkgTool.Core sfo_setentry $@ SYSTEM_VER --type Integer --maxsize 4 --value 0
+          	$(TOOLCHAIN)/bin/$(CDIR)/PkgTool.Core sfo_setentry $@ TITLE --type Utf8 --maxsize 128 --value '$(TITLE)'
+          	$(TOOLCHAIN)/bin/$(CDIR)/PkgTool.Core sfo_setentry $@ TITLE_ID --type Utf8 --maxsize 12 --value '$(TITLE_ID)'
+          	$(TOOLCHAIN)/bin/$(CDIR)/PkgTool.Core sfo_setentry $@ VERSION --type Utf8 --maxsize 8 --value '$(VERSION)'
+
+          eboot.bin: $(INTDIR) $(OBJS)
+          	$(LD) $(INTDIR)/*.o -o $(INTDIR)/$(PROJDIR).elf $(LDFLAGS)
+          	$(TOOLCHAIN)/bin/$(CDIR)/create-fself -in=$(INTDIR)/$(PROJDIR).elf -out=$(INTDIR)/$(PROJDIR).oelf --eboot "eboot.bin" --paid 0x3800000000000011
+
+          $(INTDIR)/%.o: $(PROJDIR)/%.c $(wildcard $(PROJDIR)/*.h)
+          	$(CC) $(CFLAGS) -o $@ $<
+
+          # Compile everything without linking or packaging.
+          check: $(OBJS)
+          	@echo "compile check OK: $(words $(OBJS)) objects"
+
+          clean:
+          	rm -f $(CONTENT_ID).pkg pkg.gp4 sce_sys/param.sfo eboot.bin \
+          		$(INTDIR)/$(PROJDIR).elf $(INTDIR)/$(PROJDIR).oelf $(OBJS)
+
+          .PHONY: all clean check
+          CFP_EOF_0
+          mkdir -p "$(dirname 'camera_from_phone/protocol.h')"
+          cat > 'camera_from_phone/protocol.h' <<'CFP_EOF_1'
+          // Camera From Phone - wire protocol (shared with the iOS app)
+          //
+          // One TCP connection, phone -> PS4 on CFP_PORT. Every message is a packet:
+          //
+          //   offset 0  4 bytes  magic "CFP1"
+          //   offset 4  1 byte   type
+          //   offset 5  4 bytes  payload length, little-endian
+          //   offset 9  N bytes  payload
+          //
+          // Handshake:
+          //   phone -> PS4  CFP_HELLO        payload = 4 ASCII digits (pairing code
+          //                                   shown on the PS4 screen) + device name (UTF-8, optional)
+          //   PS4 -> phone  CFP_HELLO_OK     payload = "PS4" (accepted)
+          //             or  CFP_HELLO_REJECT payload = reason text, then the PS4 closes the socket
+          //
+          // Streaming (after HELLO_OK):
+          //   phone -> PS4  CFP_FRAME        payload = one complete baseline JPEG image
+          //   phone -> PS4  CFP_PING         empty, send at least once a second when idle
+          //   either        CFP_BYE          empty, polite disconnect
+          //
+          // If the PS4 hears nothing for CFP_TIMEOUT_SECONDS it drops the connection and
+          // goes back to the pairing screen.
+
+          #ifndef CFP_PROTOCOL_H
+          #define CFP_PROTOCOL_H
+
+          #define CFP_PORT             9777
+          #define CFP_MAGIC            "CFP1"
+          #define CFP_HEADER_SIZE      9
+          #define CFP_MAX_PAYLOAD      (3 * 1024 * 1024)
+          #define CFP_TIMEOUT_SECONDS  5
+          #define CFP_CODE_LENGTH      4
+
+          enum {
+              CFP_HELLO        = 0x01,
+              CFP_HELLO_OK     = 0x02,
+              CFP_HELLO_REJECT = 0x03,
+              CFP_FRAME        = 0x10,
+              CFP_PING         = 0x20,
+              CFP_BYE          = 0x21
+          };
+
+          #endif
+          CFP_EOF_1
+          mkdir -p "$(dirname 'camera_from_phone/font.h')"
+          cat > 'camera_from_phone/font.h' <<'CFP_EOF_2'
+          // Tiny built-in 5x7 bitmap font (uppercase, digits, a little punctuation).
+          // Each glyph is 7 rows, 5 bits per row, bit 4 = leftmost pixel.
+
+          #ifndef CFP_FONT_H
+          #define CFP_FONT_H
+
+          #include <stdint.h>
+
+          #define FONT_W 5
+          #define FONT_H 7
+
+          typedef struct {
+              char    c;
+              uint8_t rows[FONT_H];
+          } FontGlyph;
+
+          static const FontGlyph kFont[] = {
+              {' ', {0, 0, 0, 0, 0, 0, 0}},
+              {'.', {0, 0, 0, 0, 0, 0x0C, 0x0C}},
+              {',', {0, 0, 0, 0, 0x0C, 0x04, 0x08}},
+              {':', {0, 0x0C, 0x0C, 0, 0x0C, 0x0C, 0}},
+              {'-', {0, 0, 0, 0x1F, 0, 0, 0}},
+              {'!', {0x04, 0x04, 0x04, 0x04, 0x04, 0, 0x04}},
+              {'/', {0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10}},
+              {'\'', {0x04, 0x04, 0x08, 0, 0, 0, 0}},
+              {'(', {0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02}},
+              {')', {0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08}},
+              {'0', {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}},
+              {'1', {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+              {'2', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}},
+              {'3', {0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E}},
+              {'4', {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}},
+              {'5', {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E}},
+              {'6', {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}},
+              {'7', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
+              {'8', {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}},
+              {'9', {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}},
+              {'A', {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+              {'B', {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}},
+              {'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}},
+              {'D', {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}},
+              {'E', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}},
+              {'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}},
+              {'G', {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}},
+              {'H', {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+              {'I', {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+              {'J', {0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C}},
+              {'K', {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}},
+              {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}},
+              {'M', {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}},
+              {'N', {0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11}},
+              {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+              {'P', {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}},
+              {'Q', {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}},
+              {'R', {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}},
+              {'S', {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}},
+              {'T', {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+              {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+              {'V', {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04}},
+              {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A}},
+              {'X', {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}},
+              {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}},
+              {'Z', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}},
+          };
+
+          static inline const uint8_t *font_glyph(char c)
+          {
+              if (c >= 'a' && c <= 'z')
+                  c = (char)(c - 'a' + 'A');
+
+              for (unsigned i = 0; i < sizeof(kFont) / sizeof(kFont[0]); i++)
+                  if (kFont[i].c == c)
+                      return kFont[i].rows;
+
+              return kFont[0].rows; // unknown -> blank
+          }
+
+          #endif
+          CFP_EOF_2
+          mkdir -p "$(dirname 'camera_from_phone/video.h')"
+          cat > 'camera_from_phone/video.h' <<'CFP_EOF_3'
+          // Minimal 1080p double-buffered video output for OpenOrbis (C).
+          // Pixel format is the one the toolchain's Scene2D sample uses:
+          // 0x80000000 | R<<16 | G<<8 | B.
+
+          #ifndef CFP_VIDEO_H
+          #define CFP_VIDEO_H
+
+          #include <stdint.h>
+
+          #define SCREEN_W       1920
+          #define SCREEN_H       1080
+          #define VIDEO_BUFFERS  2
+
+          #define RGB(r, g, b) (0x80000000u | ((uint32_t)(r) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(b))
+
+          // Returns 0 on success, negative on failure.
+          int       video_init(void);
+
+          // Pixels of the buffer currently being drawn into (SCREEN_W * SCREEN_H).
+          uint32_t *video_back(void);
+
+          // Fill every buffer with one color (used when switching screens).
+          void      video_clear_all(uint32_t color);
+
+          // Flip the back buffer to the screen (waits for vsync) and swap.
+          void      video_present(void);
+
+          #endif
+          CFP_EOF_3
+          mkdir -p "$(dirname 'camera_from_phone/video.c')"
+          cat > 'camera_from_phone/video.c' <<'CFP_EOF_4'
+          // Video output: C port of the OpenOrbis Scene2D sample (samples/_common/graphics.cpp).
+
+          #include <stdio.h>
+          #include <string.h>
+          #include <errno.h>
+
+          #include <orbis/libkernel.h>
+          #include <orbis/VideoOut.h>
+
+          #include "video.h"
+
+          #define VIDEO_MEM_SIZE   (64u * 1024u * 1024u)
+          #define VIDEO_MEM_ALIGN  0x200000u
+
+          static int                       g_video = -1;
+          static OrbisKernelEqueue         g_flipQueue;
+          static OrbisVideoOutBufferAttribute g_attr;
+          static void                     *g_videoMem = NULL;
+          static off_t                     g_directMemOff = 0;
+          static uint32_t                 *g_fb[VIDEO_BUFFERS];
+          static int                       g_active = 0;
+          static int64_t                   g_frameId = 0;
+
+          int video_init(void)
+          {
+              int rc;
+
+              g_video = sceVideoOutOpen(ORBIS_VIDEO_USER_MAIN, ORBIS_VIDEO_OUT_BUS_MAIN, 0, 0);
+              if (g_video < 0) {
+                  printf("video: sceVideoOutOpen failed (%d)\n", g_video);
+                  return -1;
+              }
+
+              rc = sceKernelCreateEqueue(&g_flipQueue, "cfp flip queue");
+              if (rc < 0) {
+                  printf("video: sceKernelCreateEqueue failed (%d)\n", rc);
+                  return -2;
+              }
+              sceVideoOutAddFlipEvent(g_flipQueue, g_video, 0);
+
+              rc = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(),
+                                                 VIDEO_MEM_SIZE, VIDEO_MEM_ALIGN, 3, &g_directMemOff);
+              if (rc < 0) {
+                  printf("video: AllocateDirectMemory failed (%d)\n", rc);
+                  return -3;
+              }
+
+              rc = sceKernelMapDirectMemory(&g_videoMem, VIDEO_MEM_SIZE, 0x33, 0, g_directMemOff, VIDEO_MEM_ALIGN);
+              if (rc < 0) {
+                  printf("video: MapDirectMemory failed (%d)\n", rc);
+                  sceKernelReleaseDirectMemory(g_directMemOff, VIDEO_MEM_SIZE);
+                  return -4;
+              }
+
+              const size_t fbBytes = (size_t)SCREEN_W * SCREEN_H * 4;
+              for (int i = 0; i < VIDEO_BUFFERS; i++)
+                  g_fb[i] = (uint32_t *)((char *)g_videoMem + (size_t)i * fbBytes);
+
+              sceVideoOutSetBufferAttribute(&g_attr, 0x80000000, 1, 0, SCREEN_W, SCREEN_H, SCREEN_W);
+
+              rc = sceVideoOutRegisterBuffers(g_video, 0, (void **)g_fb, VIDEO_BUFFERS, &g_attr);
+              if (rc != 0) {
+                  printf("video: RegisterBuffers failed (%d)\n", rc);
+                  return -5;
+              }
+
+              sceVideoOutSetFlipRate(g_video, 0);
+              return 0;
+          }
+
+          uint32_t *video_back(void)
+          {
+              return g_fb[g_active];
+          }
+
+          void video_clear_all(uint32_t color)
+          {
+              for (int b = 0; b < VIDEO_BUFFERS; b++) {
+                  uint32_t *p = g_fb[b];
+                  for (int i = 0; i < SCREEN_W * SCREEN_H; i++)
+                      p[i] = color;
+              }
+          }
+
+          void video_present(void)
+          {
+              OrbisKernelEvent evt;
+              int count;
+
+              sceVideoOutSubmitFlip(g_video, g_active, ORBIS_VIDEO_OUT_FLIP_VSYNC, g_frameId);
+
+              for (;;) {
+                  OrbisVideoOutFlipStatus st;
+                  sceVideoOutGetFlipStatus(g_video, &st);
+                  if (st.flipArg == g_frameId)
+                      break;
+                  if (sceKernelWaitEqueue(g_flipQueue, &evt, 1, &count, 0) != 0)
+                      break;
+              }
+
+              g_active = (g_active + 1) % VIDEO_BUFFERS;
+              g_frameId++;
+          }
+          CFP_EOF_4
+          mkdir -p "$(dirname 'camera_from_phone/jpeg.h')"
+          cat > 'camera_from_phone/jpeg.h' <<'CFP_EOF_5'
+          #ifndef CFP_JPEG_H
+          #define CFP_JPEG_H
+
+          #include <stdint.h>
+
+          // Decodes a JPEG into tightly packed RGB (3 bytes per pixel).
+          // Returns NULL on failure. Free the result with jpeg_free().
+          uint8_t *jpeg_decode_rgb(const uint8_t *data, int len, int *w, int *h);
+          void     jpeg_free(uint8_t *pixels);
+
+          #endif
+          CFP_EOF_5
+          mkdir -p "$(dirname 'camera_from_phone/jpeg.c')"
+          cat > 'camera_from_phone/jpeg.c' <<'CFP_EOF_6'
+          // JPEG decoding through stb_image (ships in the toolchain's include/stb).
+
+          #define STB_IMAGE_IMPLEMENTATION
+          #define STBI_ONLY_JPEG
+          #define STBI_NO_STDIO
+          #define STBI_NO_HDR
+          #define STBI_NO_LINEAR
+          #define STBI_NO_SIMD
+          #include <stb/stb_image.h>
+
+          #include "jpeg.h"
+
+          uint8_t *jpeg_decode_rgb(const uint8_t *data, int len, int *w, int *h)
+          {
+              int comp = 0;
+              return (uint8_t *)stbi_load_from_memory(data, len, w, h, &comp, 3);
+          }
+
+          void jpeg_free(uint8_t *pixels)
+          {
+              stbi_image_free(pixels);
+          }
+          CFP_EOF_6
+          mkdir -p "$(dirname 'camera_from_phone/main.c')"
+          cat > 'camera_from_phone/main.c' <<'CFP_EOF_7'
+          // Camera From Phone - PS4 receiver
+          //
+          // Target:    PS4, OpenOrbis PS4 Toolchain (homebrew), plain C
+          // Flow:      1. show a pairing screen (address + 4 digit code)
+          //            2. phone connects over TCP and sends HELLO with that code
+          //            3. PS4 answers HELLO_OK and shows "SUCCESSFULLY CONNECTED"
+          //            4. phone streams JPEG frames from its front camera, PS4 shows them full screen
+          // Protocol:  see protocol.h
+          //
+          // Single threaded: the network is polled with select() between frames, so a
+          // slow phone never blocks the picture and the picture never blocks accept().
+
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <errno.h>
+          #include <unistd.h>
+          #include <signal.h>
+          #include <sys/types.h>
+          #include <sys/socket.h>
+          #include <sys/select.h>
+          #include <sys/time.h>
+          #include <netinet/in.h>
+          #include <arpa/inet.h>
+
+          #include <orbis/libkernel.h>
+
+          #include "protocol.h"
+          #include "font.h"
+          #include "video.h"
+          #include "jpeg.h"
+
+          // Front cameras are normally shown mirrored (like a selfie preview / PS4 Camera in Playroom).
+          #define MIRROR_PREVIEW   1
+          #define MAX_FAILED_CODES 5
+
+          #define COL_BG      RGB(14, 20, 28)
+          #define COL_WHITE   RGB(240, 244, 248)
+          #define COL_DIM     RGB(140, 152, 166)
+          #define COL_ACCENT  RGB(80, 170, 255)
+          #define COL_GREEN   RGB(64, 224, 120)
+          #define COL_BLACK   RGB(0, 0, 0)
+
+          typedef enum { ST_WAITING, ST_CONNECTED, ST_STREAMING } AppState;
+
+          static AppState g_state = ST_WAITING;
+          static int      g_needRedraw = 1;
+
+          // network state
+          static int      g_listen = -1;
+          static int      g_client = -1;
+          static int      g_helloDone = 0;
+          static uint64_t g_lastRx = 0;
+          static uint8_t  g_rx[CFP_HEADER_SIZE + CFP_MAX_PAYLOAD + 65536];
+          static size_t   g_rxLen = 0;
+
+          // pairing
+          static char     g_code[CFP_CODE_LENGTH + 1];
+          static char     g_ip[48] = "?.?.?.?";
+          static char     g_phoneName[32] = "PHONE";
+          static int      g_failedCodes = 0;
+
+          static int      g_xmap[SCREEN_W];
+
+          // ---------------------------------------------------------------- drawing
+
+          static void fill_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color)
+          {
+              if (x < 0) { w += x; x = 0; }
+              if (y < 0) { h += y; y = 0; }
+              if (x + w > SCREEN_W) w = SCREEN_W - x;
+              if (y + h > SCREEN_H) h = SCREEN_H - y;
+              if (w <= 0 || h <= 0) return;
+
+              for (int yy = y; yy < y + h; yy++) {
+                  uint32_t *row = fb + (size_t)yy * SCREEN_W + x;
+                  for (int xx = 0; xx < w; xx++)
+                      row[xx] = color;
+              }
+          }
+
+          static int text_width(const char *s, int scale)
+          {
+              int n = (int)strlen(s);
+              return n > 0 ? n * (FONT_W + 1) * scale - scale : 0;
+          }
+
+          static void draw_text(uint32_t *fb, int x, int y, int scale, uint32_t color, const char *s)
+          {
+              for (; *s; s++) {
+                  const uint8_t *g = font_glyph(*s);
+                  for (int r = 0; r < FONT_H; r++)
+                      for (int c = 0; c < FONT_W; c++)
+                          if (g[r] & (1 << (FONT_W - 1 - c)))
+                              fill_rect(fb, x + c * scale, y + r * scale, scale, scale, color);
+                  x += (FONT_W + 1) * scale;
+              }
+          }
+
+          static void draw_centered(uint32_t *fb, int y, int scale, uint32_t color, const char *s)
+          {
+              draw_text(fb, (SCREEN_W - text_width(s, scale)) / 2, y, scale, color, s);
+          }
+
+          static void draw_waiting_screen(int dots)
+          {
+              uint32_t *fb = video_back();
+              char line[96];
+
+              fill_rect(fb, 0, 0, SCREEN_W, SCREEN_H, COL_BG);
+
+              draw_centered(fb, 90, 9, COL_ACCENT, "CAMERA FROM PHONE");
+              draw_centered(fb, 220, 4, COL_WHITE, "CONNECT YOUR PHONE TO CONTINUE");
+
+              draw_centered(fb, 330, 3, COL_DIM, "1. OPEN THE CAMERA FROM PHONE APP ON YOUR PHONE");
+              draw_centered(fb, 380, 3, COL_DIM, "2. ENTER THIS ADDRESS AND PAIRING CODE");
+
+              draw_centered(fb, 480, 3, COL_DIM, "ADDRESS");
+              snprintf(line, sizeof(line), "%s:%d", g_ip, CFP_PORT);
+              draw_centered(fb, 520, 8, COL_WHITE, line);
+
+              draw_centered(fb, 660, 3, COL_DIM, "PAIRING CODE");
+              draw_centered(fb, 700, 14, COL_GREEN, g_code);
+
+              snprintf(line, sizeof(line), "WAITING FOR PHONE%.*s", dots, "...");
+              draw_centered(fb, 950, 4, COL_DIM, line);
+          }
+
+          static void draw_connected_screen(void)
+          {
+              uint32_t *fb = video_back();
+              char line[96];
+
+              fill_rect(fb, 0, 0, SCREEN_W, SCREEN_H, COL_BG);
+
+              draw_centered(fb, 330, 9, COL_GREEN, "SUCCESSFULLY CONNECTED");
+
+              snprintf(line, sizeof(line), "PHONE: %s", g_phoneName);
+              draw_centered(fb, 500, 5, COL_WHITE, line);
+
+              draw_centered(fb, 620, 4, COL_DIM, "WAITING FOR FRONT CAMERA FEED...");
+              draw_centered(fb, 700, 3, COL_DIM, "ALLOW CAMERA ACCESS ON YOUR PHONE IF ASKED");
+          }
+
+          // Scales the decoded RGB image to fit 1920x1080 (letterboxed, aspect preserved).
+          static void blit_fit(uint32_t *dst, const uint8_t *src, int w, int h)
+          {
+              int dw, dh;
+
+              if ((int64_t)w * SCREEN_H > (int64_t)h * SCREEN_W) {
+                  dw = SCREEN_W;
+                  dh = (int)((int64_t)h * SCREEN_W / w);
+              } else {
+                  dh = SCREEN_H;
+                  dw = (int)((int64_t)w * SCREEN_H / h);
+              }
+              if (dw < 1) dw = 1;
+              if (dh < 1) dh = 1;
+
+              int dx = (SCREEN_W - dw) / 2;
+              int dy = (SCREEN_H - dh) / 2;
+
+              for (int x = 0; x < dw; x++) {
+                  int sx = (int)((int64_t)x * w / dw);
+          #if MIRROR_PREVIEW
+                  sx = w - 1 - sx;
+          #endif
+                  g_xmap[x] = sx * 3;
+              }
+
+              for (int y = 0; y < dh; y++) {
+                  int sy = (int)((int64_t)y * h / dh);
+                  const uint8_t *row = src + (size_t)sy * w * 3;
+                  uint32_t *out = dst + (size_t)(dy + y) * SCREEN_W + dx;
+
+                  for (int x = 0; x < dw; x++) {
+                      const uint8_t *p = row + g_xmap[x];
+                      out[x] = RGB(p[0], p[1], p[2]);
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- network
+
+          static uint64_t now_us(void)
+          {
+              return sceKernelGetProcessTime();
+          }
+
+          static int readable(int fd)
+          {
+              fd_set set;
+              struct timeval tv = {0, 0};
+
+              FD_ZERO(&set);
+              FD_SET(fd, &set);
+              return select(fd + 1, &set, NULL, NULL, &tv) > 0 && FD_ISSET(fd, &set);
+          }
+
+          static void new_pairing_code(void)
+          {
+              srand((unsigned)(now_us() ^ (now_us() >> 17)));
+              snprintf(g_code, sizeof(g_code), "%04u", (unsigned)rand() % 10000u);
+              g_failedCodes = 0;
+              g_needRedraw = 1;
+          }
+
+          // Connecting a UDP socket sends nothing, but makes the kernel pick the local
+          // address it would use to reach the internet -> that is the console's LAN IP.
+          static void detect_ip(void)
+          {
+              char ip[48] = "";
+              int s = socket(AF_INET, SOCK_DGRAM, 0);
+
+              if (s >= 0) {
+                  struct sockaddr_in peer, me;
+                  socklen_t len = sizeof(me);
+
+                  memset(&peer, 0, sizeof(peer));
+                  peer.sin_family = AF_INET;
+                  peer.sin_port = htons(53);
+                  inet_pton(AF_INET, "8.8.8.8", &peer.sin_addr);
+
+                  if (connect(s, (struct sockaddr *)&peer, sizeof(peer)) == 0 &&
+                      getsockname(s, (struct sockaddr *)&me, &len) == 0)
+                      inet_ntop(AF_INET, &me.sin_addr, ip, sizeof(ip));
+
+                  close(s);
+              }
+
+              if (ip[0] == '\0' || strcmp(ip, "0.0.0.0") == 0)
+                  snprintf(ip, sizeof(ip), "SEE NETWORK SETTINGS");
+
+              if (strcmp(ip, g_ip) != 0) {
+                  snprintf(g_ip, sizeof(g_ip), "%s", ip);
+                  g_needRedraw = 1;
+              }
+          }
+
+          static int listen_init(void)
+          {
+              struct sockaddr_in addr;
+              int yes = 1;
+
+              g_listen = socket(AF_INET, SOCK_STREAM, 0);
+              if (g_listen < 0) {
+                  printf("net: socket failed: %s\n", strerror(errno));
+                  return -1;
+              }
+              setsockopt(g_listen, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+              memset(&addr, 0, sizeof(addr));
+              addr.sin_family = AF_INET;
+              addr.sin_addr.s_addr = htonl(INADDR_ANY);
+              addr.sin_port = htons(CFP_PORT);
+
+              if (bind(g_listen, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+                  printf("net: bind :%d failed: %s\n", CFP_PORT, strerror(errno));
+                  return -2;
+              }
+              if (listen(g_listen, 2) != 0) {
+                  printf("net: listen failed: %s\n", strerror(errno));
+                  return -3;
+              }
+              return 0;
+          }
+
+          static int send_all(int fd, const void *buf, size_t len)
+          {
+              const uint8_t *p = (const uint8_t *)buf;
+
+              while (len > 0) {
+                  ssize_t n = send(fd, p, len, 0);
+                  if (n <= 0)
+                      return -1;
+                  p += n;
+                  len -= (size_t)n;
+              }
+              return 0;
+          }
+
+          static int send_packet(int fd, uint8_t type, const void *payload, uint32_t len)
+          {
+              uint8_t hdr[CFP_HEADER_SIZE];
+
+              memcpy(hdr, CFP_MAGIC, 4);
+              hdr[4] = type;
+              hdr[5] = (uint8_t)(len & 0xFF);
+              hdr[6] = (uint8_t)((len >> 8) & 0xFF);
+              hdr[7] = (uint8_t)((len >> 16) & 0xFF);
+              hdr[8] = (uint8_t)((len >> 24) & 0xFF);
+
+              if (send_all(fd, hdr, sizeof(hdr)) != 0)
+                  return -1;
+              return len ? send_all(fd, payload, len) : 0;
+          }
+
+          static void drop_client(void)
+          {
+              if (g_client >= 0)
+                  close(g_client);
+
+              g_client = -1;
+              g_helloDone = 0;
+              g_rxLen = 0;
+
+              if (g_state != ST_WAITING) {
+                  g_state = ST_WAITING;
+                  g_needRedraw = 1;
+              }
+          }
+
+          static void accept_client(void)
+          {
+              struct sockaddr_in peer;
+              socklen_t len = sizeof(peer);
+              int fd = accept(g_listen, (struct sockaddr *)&peer, &len);
+
+              if (fd < 0)
+                  return;
+
+              // A phone that crashed and reconnects replaces its dead session.
+              drop_client();
+
+              g_client = fd;
+              g_helloDone = 0;
+              g_rxLen = 0;
+              g_lastRx = now_us();
+              printf("net: client connected\n");
+          }
+
+          // Returns 0 to keep the connection, -1 to drop it.
+          static int on_hello(const uint8_t *payload, uint32_t len)
+          {
+              if (g_helloDone)
+                  return 0;
+
+              if (len < CFP_CODE_LENGTH || memcmp(payload, g_code, CFP_CODE_LENGTH) != 0) {
+                  const char msg[] = "BAD PAIRING CODE";
+                  send_packet(g_client, CFP_HELLO_REJECT, msg, sizeof(msg) - 1);
+
+                  if (++g_failedCodes >= MAX_FAILED_CODES)
+                      new_pairing_code(); // stop someone guessing the code on the LAN
+                  return -1;
+              }
+
+              // Device name: whatever follows the code, printable ASCII only.
+              size_t n = 0;
+              for (uint32_t i = CFP_CODE_LENGTH; i < len && n < sizeof(g_phoneName) - 1; i++) {
+                  uint8_t c = payload[i];
+                  g_phoneName[n++] = (c >= 32 && c < 127) ? (char)c : '?';
+              }
+              g_phoneName[n] = '\0';
+              if (n == 0)
+                  snprintf(g_phoneName, sizeof(g_phoneName), "PHONE");
+
+              if (send_packet(g_client, CFP_HELLO_OK, "PS4", 3) != 0)
+                  return -1;
+
+              g_helloDone = 1;
+              g_state = ST_CONNECTED;
+              g_needRedraw = 1;
+              printf("net: paired with %s\n", g_phoneName);
+              return 0;
+          }
+
+          static void show_frame(const uint8_t *jpg, uint32_t len)
+          {
+              int w = 0, h = 0;
+              uint8_t *px = jpeg_decode_rgb(jpg, (int)len, &w, &h);
+
+              if (!px)
+                  return; // corrupt frame, wait for the next one
+
+              if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
+                  jpeg_free(px);
+                  return;
+              }
+
+              if (g_state != ST_STREAMING) {
+                  g_state = ST_STREAMING;
+                  video_clear_all(COL_BLACK);
+                  printf("video: first frame %dx%d\n", w, h);
+              }
+
+              blit_fit(video_back(), px, w, h);
+              jpeg_free(px);
+              video_present();
+          }
+
+          // Parses every complete packet in the receive buffer. Only the newest FRAME is
+          // decoded, so a slow console drops old frames instead of falling behind.
+          static int process_rx(void)
+          {
+              size_t off = 0;
+              const uint8_t *frame = NULL;
+              uint32_t frameLen = 0;
+
+              while (g_rxLen - off >= CFP_HEADER_SIZE) {
+                  const uint8_t *h = g_rx + off;
+
+                  if (memcmp(h, CFP_MAGIC, 4) != 0)
+                      return -1;
+
+                  uint8_t type = h[4];
+                  uint32_t len = (uint32_t)h[5] | ((uint32_t)h[6] << 8) |
+                                 ((uint32_t)h[7] << 16) | ((uint32_t)h[8] << 24);
+
+                  if (len > CFP_MAX_PAYLOAD)
+                      return -1;
+                  if (g_rxLen - off < (size_t)CFP_HEADER_SIZE + len)
+                      break;
+
+                  const uint8_t *payload = h + CFP_HEADER_SIZE;
+
+                  switch (type) {
+                  case CFP_HELLO:
+                      if (on_hello(payload, len) != 0)
+                          return -1;
+                      break;
+                  case CFP_FRAME:
+                      if (g_helloDone) {
+                          frame = payload;
+                          frameLen = len;
+                      }
+                      break;
+                  case CFP_BYE:
+                      return -1;
+                  default: // PING and unknown types just keep the link alive
+                      break;
+                  }
+
+                  off += (size_t)CFP_HEADER_SIZE + len;
+              }
+
+              if (frame)
+                  show_frame(frame, frameLen);
+
+              if (off > 0) {
+                  memmove(g_rx, g_rx + off, g_rxLen - off);
+                  g_rxLen -= off;
+              }
+              return 0;
+          }
+
+          // ---------------------------------------------------------------- main
+
+          int main(void)
+          {
+              uint64_t lastDraw = 0, lastIp = 0;
+              int dots = 0;
+
+              setvbuf(stdout, NULL, _IONBF, 0);
+              signal(SIGPIPE, SIG_IGN);
+
+              if (video_init() != 0) {
+                  printf("fatal: video init failed\n");
+                  for (;;) sceKernelUsleep(1000000);
+              }
+
+              new_pairing_code();
+              detect_ip();
+
+              if (listen_init() != 0) {
+                  printf("fatal: could not open port %d\n", CFP_PORT);
+                  for (;;) sceKernelUsleep(1000000);
+              }
+
+              printf("Camera From Phone ready: %s:%d code %s\n", g_ip, CFP_PORT, g_code);
+
+              for (;;) {
+                  int busy = 0;
+                  uint64_t t = now_us();
+
+                  if (readable(g_listen)) {
+                      accept_client();
+                      busy = 1;
+                  }
+
+                  if (g_client >= 0 && readable(g_client)) {
+                      size_t room = sizeof(g_rx) - g_rxLen;
+                      ssize_t n = room ? recv(g_client, g_rx + g_rxLen, room, 0) : -1;
+
+                      if (n <= 0) {
+                          printf("net: client gone\n");
+                          drop_client();
+                      } else {
+                          g_rxLen += (size_t)n;
+                          g_lastRx = t;
+                          busy = 1;
+                          if (process_rx() != 0)
+                              drop_client();
+                      }
+                  }
+
+                  if (g_client >= 0 && t - g_lastRx > (uint64_t)CFP_TIMEOUT_SECONDS * 1000000ull) {
+                      printf("net: client timed out\n");
+                      drop_client();
+                  }
+
+                  if (g_state == ST_WAITING) {
+                      if (t - lastIp > 5000000ull) {
+                          detect_ip();
+                          lastIp = t;
+                      }
+                      if (g_needRedraw || t - lastDraw > 500000ull) {
+                          draw_waiting_screen(dots);
+                          video_present();
+                          dots = (dots + 1) % 4;
+                          lastDraw = t;
+                          g_needRedraw = 0;
+                          busy = 1;
+                      }
+                  } else if (g_state == ST_CONNECTED && g_needRedraw) {
+                      draw_connected_screen();
+                      video_present();
+                      g_needRedraw = 0;
+                      busy = 1;
+                  }
+
+                  if (!busy)
+                      sceKernelUsleep(2000);
+              }
+
+              return 0;
+          }
+          CFP_EOF_7
+          # icon and about blob come from the toolchain release samples
+          ICON=$(find "$OO_PS4_TOOLCHAIN/samples" -path '*hello_world/sce_sys/icon0.png' | head -n1)
+          SPRX=$(find "$OO_PS4_TOOLCHAIN/samples" -path '*hello_world/sce_sys/about/right.sprx' | head -n1)
+          cp "$ICON" sce_sys/icon0.png
+          cp "$SPRX" sce_sys/about/right.sprx
+          # libc.prx + libSceFios2.prx must ship inside the package (sce_module/),
+          # otherwise the PS4 reports the app as corrupted at launch.
+          for M in libc.prx libSceFios2.prx; do
+            F=$(find "$OO_PS4_TOOLCHAIN" -name "$M" | head -n1)
+            if [ -z "$F" ]; then echo "ERROR: $M not found in toolchain release"; exit 1; fi
+            cp "$F" sce_module/
+          done
+          find . -type f | sort
+
+      - name: Compile and prepare package files
+        run: |
+          cd work/camera_from_phone
+          make pkg.gp4
+
+      - name: Build PKG in an Ubuntu 20.04 container (native OpenSSL 1.1)
+        run: |
+          cd work/camera_from_phone
+          docker run --rm \
+            -v "$PWD":"$PWD" -v "$OO_PS4_TOOLCHAIN":"$OO_PS4_TOOLCHAIN" -w "$PWD" \
+            -e TC="$OO_PS4_TOOLCHAIN" -e DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
+            ubuntu:20.04 bash -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libssl1.1 libicu66 ca-certificates > /dev/null && "$TC/bin/linux/PkgTool.Core" pkg_build pkg.gp4 .'
+          ls -la
+
+      - name: Collect output
+        if: always()
+        run: |
+          mkdir -p out
+          cp work/camera_from_phone/*.pkg out/ 2>/dev/null || true
+          cp work/camera_from_phone/eboot.bin work/camera_from_phone/pkg.gp4 out/ 2>/dev/null || true
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: camera-from-phone-ps4
+          path: out/
